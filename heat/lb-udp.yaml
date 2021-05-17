@@ -1,0 +1,295 @@
+heat_template_version: pike
+
+description: >
+  HOT template to create a private network, with a router to the public network \
+  one jumpbox on private network, connected to a floating ip \
+  two UDP servers on a private network port 9090 \
+  one lbaas connected to private network, connected to the floating IP \
+  the lbass pool listners to the two UDP servers
+
+parameters:
+  key_name:
+    type: string
+    default: ubuntu-keypair
+    description: Name of keypair to assign to servers
+  image:
+    type: string
+    default: bionic-kvm
+    description: Name of image to use for servers
+  flavor:
+    type: string
+    default: m1.small
+    description: Flavor to use for servers
+  public_net:
+    type: string
+    default: ext-net
+    description: >
+      ID or name of public network for which floating IP addresses will be allocated
+
+resources:
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: web_private_net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: 10.4.22.0/24
+      allocation_pools:
+        - start: 10.4.22.10
+          end: 10.4.22.50
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_net }
+
+  private_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  allow_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - direction: ingress
+          protocol: tcp
+          port_range_max: 22
+          port_range_min: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  allow_icmp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+
+  allow_udp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - direction: ingress
+          protocol: udp
+          port_range_max: 9090
+          port_range_min: 9090
+          remote_ip_prefix: 0.0.0.0/0
+
+  jumpbox:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: jump_box_port }
+      user_data: |
+        #!/bin/bash
+        cat > /srv/client.py << EOL
+        #!/usr/bin/env python3
+        import socket
+        import sys
+
+        MESSAGE = "This is the a msg from the clinet".encode()
+        sockout = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+        def one_time_tx_rx(OUT_IP, OUT_PORT):
+            sockout.sendto(MESSAGE, (OUT_IP, OUT_PORT))
+            msgFromServer = sockout.recvfrom(1024)
+            print(msgFromServer[0])
+
+
+        if __name__ == "__main__":
+            one_time_tx_rx(sys.argv[1], int(sys.argv[2]))
+        EOL
+        chmod u+x /srv/client.py
+
+  jump_box_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  jump_box_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_net }
+      port_id: { get_resource: jump_box_port }
+
+  server1:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: private_net }
+          subnet: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+        - { get_resource: allow_udp }
+      user_data: |
+        #!/bin/bash
+        cat > /srv/server.py << EOL
+        #!/usr/bin/env python3
+        import socket
+        import platform
+
+        UDP_IP = "0.0.0.0"
+        UDP_PORT = 9090
+
+
+        sock = socket.socket(socket.AF_INET,  # Internet
+                             socket.SOCK_DGRAM)  # UDP
+        sock.bind((UDP_IP, UDP_PORT))
+
+        while True:
+            data, addr = sock.recvfrom(1024)
+            response = '%s: HELLO, I AM ALIVE!!!\n' % platform.node()
+            sent = sock.sendto(response.encode(), addr)
+        EOL
+
+        cat > /lib/systemd/system/udpserver.service << EOL
+        [Unit]
+        Description=UDP listener
+        After=multi-user.target
+        [Service]
+        Type=simple
+        ExecStart=/srv/server.py
+        StandardInput=tty-force
+
+        [Install]
+        WantedBy=multi-user.target
+        EOL
+
+        sudo chmod u+x /srv/server.py
+        sudo systemctl daemon-reload
+        sudo systemctl enable udpserver.service
+        sudo systemctl start udpserver.service
+
+  server2:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: private_net }
+          subnet: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+        - { get_resource: allow_udp }
+      user_data: |
+        #!/bin/bash
+        cat > /srv/server.py << EOL
+        #!/usr/bin/env python3
+        import socket
+        import platform
+
+        UDP_IP = "0.0.0.0"
+        UDP_PORT = 9090
+
+
+        sock = socket.socket(socket.AF_INET,  # Internet
+                             socket.SOCK_DGRAM)  # UDP
+        sock.bind((UDP_IP, UDP_PORT))
+
+        while True:
+            data, addr = sock.recvfrom(1024)
+            response = '%s: HELLO, I AM ALIVE!!!\n' % platform.node()
+            sent = sock.sendto(response.encode(), addr)
+        EOL
+
+        cat > /lib/systemd/system/udpserver.service << EOL
+        [Unit]
+        Description=UDP listener
+        After=multi-user.target
+        [Service]
+        Type=simple
+        ExecStart=/srv/server.py
+        StandardInput=tty-force
+
+        [Install]
+        WantedBy=multi-user.target
+        EOL
+
+        sudo chmod u+x /srv/server.py
+        sudo systemctl daemon-reload
+        sudo systemctl enable udpserver.service
+        sudo systemctl start udpserver.service
+
+  lb:
+   type: OS::Octavia::LoadBalancer
+   properties:
+      vip_subnet: {get_resource: private_subnet}
+
+  lb_port:
+    type: OS::Neutron::Port
+    properties:
+      fixed_ips:
+      - subnet_id: {get_resource: private_subnet}
+      network_id: {get_resource: private_net}
+      port_security_enabled: true
+      security_groups:
+        - { get_resource: allow_udp }
+        - { get_resource: allow_icmp }
+
+  lb_floating:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: {get_attr: [lb, vip_port_id]}
+
+  listener:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: {get_resource: lb}
+      protocol: UDP
+      protocol_port: 9090
+
+  pool:
+    type: OS::Octavia::Pool
+    properties:
+      listener: {get_resource: listener}
+      lb_algorithm: ROUND_ROBIN
+      protocol: UDP
+
+  pool_member1:
+    type: OS::Octavia::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [server1, first_address] }
+      protocol_port: 9090
+      subnet: { get_resource: private_subnet }
+
+  pool_member2:
+    type: OS::Octavia::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [server2, first_address] }
+      protocol_port: 9090
+      subnet: { get_resource: private_subnet }
+
+outputs:
+  jumpbox_public_ip:
+    description: Floating IP address of jumpbox in public network
+    value:
+      get_attr: [jump_box_floating_ip, floating_ip_address]
+
+  lb_public_ip:
+    description: Floating IP address of lbaas in public network
+    value:
+      get_attr: [lb_floating, floating_ip_address]
+

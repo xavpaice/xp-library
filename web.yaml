@@ -1,0 +1,354 @@
+heat_template_version: pike
+
+description: >
+  HOT template to create a private network, with a router to the public network \
+  one jumpbox on private network, connected to a floating ip \
+  two nginx servers on a private network \
+  one lbaas connected to private network, connected to the floating IP \
+  the lbass pool listners to the two nginx servers
+
+parameters:
+  key_name:
+    type: string
+    default: ubuntu-keypair
+    description: Name of keypair to assign to servers
+  image:
+    type: string
+    default: bionic-kvm
+    description: Name of image to use for servers
+  flavor:
+    type: string
+    default: m1.small
+    description: Flavor to use for servers
+  public_net:
+    type: string
+    default: ext-net
+    description: >
+      ID or name of public network for which floating IP addresses will be allocated
+
+resources:
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: web_private_net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: 10.4.22.0/24
+      allocation_pools:
+        - start: 10.4.22.10
+          end: 10.4.22.50
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_net }
+
+  private_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  allow_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - direction: ingress
+          protocol: tcp
+          port_range_max: 22
+          port_range_min: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  allow_icmp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+
+  allow_web:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - direction: ingress
+          protocol: tcp
+          port_range_max: 80
+          port_range_min: 80
+          remote_ip_prefix: 0.0.0.0/0
+
+  allow_ssl:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - direction: ingress
+          protocol: tcp
+          port_range_max: 443
+          port_range_min: 443
+          remote_ip_prefix: 0.0.0.0/0
+
+  jumpbox:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: jump_box_port }
+
+  jump_box_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  jump_box_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_net }
+      port_id: { get_resource: jump_box_port }
+
+  server1:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: private_net }
+          subnet: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+        - { get_resource: allow_web }
+        - { get_resource: allow_ssl }
+      user_data: |
+        #!/bin/bash
+        sudo apt update
+        sudo apt install -y nginx
+        cat > /var/www/html/index.html << EOL
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <title>Welcome to nginx web1!</title>
+        <style>
+            body {
+                width: 35em;
+                margin: 0 auto;
+                font-family: Tahoma, Verdana, Arial, sans-serif;
+            }
+        </style>
+        </head>
+        <body bgcolor="#7FFFD4"">
+        <body>
+        <h1>Welcome to nginx web1!</h1>
+        <p>If you see this page, the nginx web server is successfully installed and
+        working. Further configuration is required.</p>
+
+        <p>For online documentation and support please refer to
+        <a href="http://nginx.org/">nginx.org</a>.<br/>
+        Commercial support is available at
+        <a href="http://nginx.com/">nginx.com</a>.</p>
+
+        <p><em>Thank you for using nginx.</em></p>
+        </body>
+        </html>
+        EOL
+
+        sudo mkdir /etc/nginx/ssl
+        sudo openssl req -subj "/C=PL/ST=Denial/O=Dis/L=Springfield/CN=example.org/OU=IT/emailAddress=example@example.org/" -sha256  -x509 -nodes -days 730 -newkey rsa:4096 -keyout /etc/nginx/ssl/nginx.key -out /etc/nginx/ssl/nginx.crt
+        sudo mv /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
+
+        cat > /etc/nginx/sites-available/default << EOL
+        server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                listen 443 ssl default_server;
+                listen [::]:443 ssl default_server;
+                root /var/www/html;
+                index index.html;
+                server_name _;
+                ssl_certificate /etc/nginx/ssl/nginx.crt;
+                ssl_certificate_key /etc/nginx/ssl/nginx.key;
+        }
+        EOL
+        cat > /etc/nginx/snippets/self-signed.conf  << EOL
+        ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+        ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+        EOL
+        sudo openssl dhparam -out /etc/ssl/certs/dhparam.pem 2048
+        sudo service nginx restart
+
+  server2:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: private_net }
+          subnet: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: allow_ssh }
+        - { get_resource: allow_icmp }
+        - { get_resource: allow_web }
+        - { get_resource: allow_ssl }
+      user_data: |
+        #!/bin/bash
+        sudo apt update
+        sudo apt install -y nginx
+        cat > /var/www/html/index.html << EOL
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <title>Welcome to nginx web2!</title>
+        <style>
+            body {
+                width: 35em;
+                margin: 0 auto;
+                font-family: Tahoma, Verdana, Arial, sans-serif;
+            }
+        </style>
+        </head>
+        <body bgcolor="#00FFFF">
+        <body>
+        <h1>Welcome to nginx web2!</h1>
+        <p>If you see this page, the nginx web server is successfully installed and
+        working. Further configuration is required.</p>
+
+        <p>For online documentation and support please refer to
+        <a href="http://nginx.org/">nginx.org</a>.<br/>
+        Commercial support is available at
+        <a href="http://nginx.com/">nginx.com</a>.</p>
+
+        <p><em>Thank you for using nginx.</em></p>
+        </body>
+        </html>
+        EOL
+        
+        sudo mkdir /etc/nginx/ssl
+        sudo openssl req -subj "/C=PL/ST=Denial/O=Dis/L=Springfield/CN=example.org/OU=IT/emailAddress=example@example.org/" -sha256  -x509 -nodes -days 730 -newkey rsa:4096 -keyout /etc/nginx/ssl/nginx.key -out /etc/nginx/ssl/nginx.crt
+        sudo mv /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
+
+        cat > /etc/nginx/sites-available/default << EOL
+        server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                listen 443 ssl default_server;
+                listen [::]:443 ssl default_server;
+                root /var/www/html;
+                index index.html;
+                server_name _;
+                ssl_certificate /etc/nginx/ssl/nginx.crt;
+                ssl_certificate_key /etc/nginx/ssl/nginx.key;
+        }
+        EOL
+        cat > /etc/nginx/snippets/self-signed.conf  << EOL
+        ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+        ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+        EOL
+        sudo openssl dhparam -out /etc/ssl/certs/dhparam.pem 2048
+        sudo service nginx restart
+
+  lb:
+   type: OS::Neutron::LBaaS::LoadBalancer
+   properties:
+      vip_subnet: {get_resource: private_subnet}
+
+  lb_port:
+    type: OS::Neutron::Port
+    properties:
+      fixed_ips:
+      - subnet_id: {get_resource: private_subnet}
+      network_id: {get_resource: private_net}
+      port_security_enabled: true
+      security_groups:
+        - { get_resource: allow_web }
+        - { get_resource: allow_ssl }
+        - { get_resource: allow_icmp }
+
+  lb_floating:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: {get_attr: [lb, vip_port_id]}
+
+  listener:
+    type: OS::Neutron::LBaaS::Listener
+    properties:
+      loadbalancer: {get_resource: lb}
+      protocol: HTTP
+      protocol_port: 80
+
+  pool:
+    type: OS::Neutron::LBaaS::Pool
+    properties:
+      listener: {get_resource: listener}
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+
+  pool_member1:
+    type: OS::Neutron::LBaaS::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [server1, first_address] }
+      protocol_port: 80
+      subnet: { get_resource: private_subnet }
+
+  pool_member2:
+    type: OS::Neutron::LBaaS::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [server2, first_address] }
+      protocol_port: 80
+      subnet: { get_resource: private_subnet }
+
+  listener2:
+    type: OS::Neutron::LBaaS::Listener
+    properties:
+      loadbalancer: {get_resource: lb}
+      protocol: HTTPS
+      protocol_port: 443
+
+  pool2:
+    type: OS::Neutron::LBaaS::Pool
+    properties:
+      listener: {get_resource: listener2}
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTPS
+#      session_persistence: {'type': 'SOURCE_IP'}
+
+  pool2_member1:
+    type: OS::Neutron::LBaaS::PoolMember
+    properties:
+      pool: { get_resource: pool2 }
+      address: { get_attr: [server1, first_address] }
+      protocol_port: 443
+      subnet: { get_resource: private_subnet }
+
+  pool2_member2:
+    type: OS::Neutron::LBaaS::PoolMember
+    properties:
+      pool: { get_resource: pool2 }
+      address: { get_attr: [server2, first_address] }
+      protocol_port: 443
+      subnet: { get_resource: private_subnet }
+
+outputs:
+  jumpbox_public_ip:
+    description: Floating IP address of jumpbox in public network
+    value:
+      get_attr: [jump_box_floating_ip, floating_ip_address]
+
+  lb_public_ip:
+    description: Floating IP address of lbaas in public network
+    value:
+      get_attr: [lb_floating, floating_ip_address]
+
